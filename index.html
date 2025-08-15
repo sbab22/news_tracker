@@ -2,225 +2,141 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>Mining News + TSX Move</title>
+<title>Mining News (Robust Feed)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   body { font-family: Arial, sans-serif; padding: 20px; background: #f9f9f9; }
-  .news-item { padding: 12px 10px; margin-bottom: 12px; border-bottom: 1px solid #ddd; }
-  .news-item a { font-weight: bold; text-decoration: none; color: #2a4d69; }
+  h1 { margin-top: 0; }
+  #status { font-size: 0.9em; color: #555; margin-bottom: 10px; white-space: pre-wrap; }
+  .news-item { padding: 10px 0; border-bottom: 1px solid #ddd; }
+  .news-item a { font-weight: bold; color: #2a4d69; text-decoration: none; }
   .news-item a:hover { text-decoration: underline; }
   .date { font-size: 0.9em; color: #555; margin-top: 2px; }
-  .stock { font-size: 0.92em; margin-top: 6px; }
-  .stock .ticker { font-weight: 600; }
-  .stock .up { color: #0a7a0a; }
-  .stock .down { color: #b00020; }
+  .error { color: #b00020; }
   .muted { color: #777; }
 </style>
 </head>
 <body>
 <h1>Latest Junior Mining News</h1>
-<div id="news">Loading...</div>
+<div id="status" class="muted">Starting…</div>
+<div id="news">Loading…</div>
 
 <script>
 /* -------------------- Config -------------------- */
 const FEED_URL = 'https://www.juniorminingnetwork.com/index.php?option=com_obrss&task=feed&id=1:press-releases&format=feed&Itemid=688';
-const FEED_PROXY = 'https://corsproxy.io/?' + encodeURIComponent(FEED_URL);
 
-// Yahoo endpoints
-const YH_SEARCH = q =>
-  `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&enableFuzzyQuery=true&quotesQueryId=tss_match_phrase_query&multiQuoteQueryId=multi_quote_single_token_query&region=CA&lang=en-US`;
-const YH_CHART = (symbol, p1, p2) =>
-  `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${p1}&period2=${p2}&interval=1d`;
+// Prefer multiple fallbacks for CORS
+function viaCorsproxy(url) {
+  return 'https://corsproxy.io/?' + encodeURIComponent(url);
+}
+function viaAllOrigins(url) {
+  return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
+}
+function viaJina(url) {
+  const withHttps = url.startsWith('https://') ? url : 'https://' + url.replace(/^https?:\/\//, '');
+  // r.jina.ai returns text/plain, which is fine for XML text parsing
+  return 'https://r.jina.ai/http/' + withHttps.replace(/^https?:\/\//, '');
+}
 
-// Optional proxy for Yahoo if your browser blocks CORS
-const USE_PROXY = false;
-const proxy = u => (USE_PROXY ? 'https://corsproxy.io/?' + encodeURIComponent(u) : u);
-
-// Be polite: small delay between Yahoo calls
-const pause = ms => new Promise(r => setTimeout(r, ms));
-
-/* -------------------- Helpers -------------------- */
-// Try to get a company name from a press release title
-function extractCompanyFromTitle(title) {
-  // Heuristic: many PRs start with "Company Name ..." until a keyword.
-  const breakers = [
-    ' announces', ' closes', ' provides', ' reports', ' intersects', ' drills',
-    ' signs', ' acquires', ' starts', ' begins', ' receives', ' appoints', ' options',
-    ' to ', ' enters', ' discovers', ' updates', ' expands', ' increases'
+// Try several URLs in order; return first successful Response
+async function fetchWithFallbacks(url, { asText = true } = {}) {
+  const attempts = [
+    url,                     // direct (rarely allowed for RSS)
+    viaCorsproxy(url),
+    viaAllOrigins(url),
+    viaJina(url),
   ];
-  const lower = title.toLowerCase();
-  let cut = title.length;
-  for (const b of breakers) {
-    const i = lower.indexOf(b);
-    if (i > 0) cut = Math.min(cut, i);
-  }
-  let candidate = title.slice(0, cut).trim();
-
-  // Clean trailing punctuation and symbols often added before amounts
-  candidate = candidate.replace(/[-–—|:•]+$/g, '').trim();
-
-  // If the first word is "The", drop it (often "The Company")
-  candidate = candidate.replace(/^The\s+/i, '');
-
-  // If it still looks too short, fall back to first 3 words
-  if (candidate.split(/\s+/).length < 2) {
-    candidate = title.split(/\s+/).slice(0, 3).join(' ');
-  }
-  return candidate;
-}
-
-// Prefer Canadian listings from Yahoo Search results (TSX/TSXV)
-function pickCanadianSymbol(searchJson) {
-  if (!searchJson || !Array.isArray(searchJson.quotes)) return null;
-
-  // Normal Canadian suffixes on Yahoo
-  const preferredSuffixes = ['.TO', '.V', '.CN']; // TSX, TSXV, CSE
-  const preferredExchanges = ['TOR', 'TSX', 'TSXV', 'CNQ', 'CNSX', 'NEO'];
-
-  // 1) Exact Canadian suffix first
-  for (const q of searchJson.quotes) {
-    if (q && q.symbol && preferredSuffixes.some(s => q.symbol.endsWith(s))) {
-      return q.symbol;
+  let lastErr;
+  for (const u of attempts) {
+    try {
+      logStatus('Trying: ' + u);
+      const res = await fetch(u);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return asText ? await res.text() : await res.arrayBuffer();
+    } catch (e) {
+      lastErr = e;
+      logStatus('Failed: ' + u + ' — ' + e.message);
+      console.error('Fetch failed', u, e);
     }
   }
-  // 2) Exchange hint second
-  for (const q of searchJson.quotes) {
-    if (q && preferredExchanges.includes((q.exchange || '').toUpperCase())) {
-      return q.symbol;
-    }
-  }
-  // 3) Otherwise, first equity-like result
-  for (const q of searchJson.quotes) {
-    if (q && (q.quoteType === 'EQUITY' || q.quoteType === 'ETF')) {
-      return q.symbol;
-    }
-  }
-  return null;
+  throw lastErr ?? new Error('All attempts failed');
 }
 
-function firstAndLastValidClose(closes) {
-  if (!closes || !closes.length) return [null, null];
-  let first = null, last = null;
-  for (let i = 0; i < closes.length; i++) {
-    if (closes[i] != null) { first = closes[i]; break; }
-  }
-  for (let i = closes.length - 1; i >= 0; i--) {
-    if (closes[i] != null) { last = closes[i]; break; }
-  }
-  return [first, last];
+function logStatus(msg, isError = false) {
+  const el = document.getElementById('status');
+  el.textContent += (el.textContent ? '\n' : '') + msg;
+  if (isError) el.classList.add('error');
 }
 
-function pctChange(a, b) {
-  if (a == null || b == null) return null;
-  return ((b - a) / a) * 100;
+// Safe XML parse (shows parsererror details if any)
+function parseXmlOrThrow(text) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(text, 'application/xml');
+  const err = xml.querySelector('parsererror');
+  if (err) {
+    // Some proxies wrap content; show first 200 chars for debugging
+    const snippet = text.slice(0, 200).replace(/\s+/g, ' ');
+    throw new Error('XML parse error. First 200 chars: ' + snippet);
+  }
+  return xml;
 }
 
-/* -------------------- Yahoo calls -------------------- */
-async function searchTickerByName(name) {
+async function loadFeed() {
+  const newsEl = document.getElementById('news');
   try {
-    const r = await fetch(proxy(YH_SEARCH(name)));
-    const j = await r.json();
-    return pickCanadianSymbol(j);
-  } catch (e) {
-    console.error('Search error:', e);
-    return null;
-  }
-}
+    logStatus('Fetching RSS…');
+    const xmlText = await fetchWithFallbacks(FEED_URL, { asText: true });
+    logStatus('Fetched. Parsing XML…');
+    const xml = parseXmlOrThrow(xmlText);
 
-async function getPctChangeAroundDate(symbol, newsDateIso) {
-  const newsMs = new Date(newsDateIso).getTime();
-  if (isNaN(newsMs)) return { change: null, periodText: null };
-
-  // ±2 days in seconds (Yahoo needs UNIX seconds)
-  const day = 24 * 60 * 60 * 1000;
-  const p1 = Math.floor((newsMs - 2 * day) / 1000);
-  const p2 = Math.floor((newsMs + 2 * day) / 1000);
-
-  try {
-    const r = await fetch(proxy(YH_CHART(symbol, p1, p2)));
-    const j = await r.json();
-    const result = j?.chart?.result?.[0];
-    const closes = result?.indicators?.quote?.[0]?.close || [];
-    const [before, after] = firstAndLastValidClose(closes);
-    const chg = pctChange(before, after);
-    return {
-      change: chg,
-      periodText: '±2 trading days',
-    };
-  } catch (e) {
-    console.error('Chart error:', e);
-    return { change: null, periodText: null };
-  }
-}
-
-/* -------------------- Feed flow -------------------- */
-async function fetchNews() {
-  const container = document.getElementById('news');
-  container.textContent = 'Loading…';
-  try {
-    const res = await fetch(FEED_PROXY);
-    const xmlText = await res.text();
-    const xml = new DOMParser().parseFromString(xmlText, 'application/xml');
+    // RSS 2.0 uses <item>
     const items = Array.from(xml.querySelectorAll('item'));
-    container.innerHTML = '';
-
-    // Limit to first N if you like (to reduce API calls):
-    const N = Math.min(15, items.length);
-    for (let idx = 0; idx < N; idx++) {
-      const item = items[idx];
-      const title = item.querySelector('title')?.textContent?.trim() || 'No Title';
-      const link = item.querySelector('link')?.textContent || '#';
-      const pubDateStr = item.querySelector('pubDate')?.textContent || '';
-      const iso = pubDateStr ? new Date(pubDateStr).toISOString() : null;
-      const dateNice = iso ? new Date(iso).toLocaleString() : 'No Date';
-
-      const el = document.createElement('div');
-      el.className = 'news-item';
-      el.innerHTML = `
-        <a href="${link}" target="_blank" rel="noopener">${title}</a>
-        <div class="date">${dateNice}</div>
-        <div class="stock muted">Detecting ticker…</div>
-      `;
-      container.appendChild(el);
-
-      // 1) Guess company name, 2) search Yahoo, 3) fetch chart, 4) show change
-      const company = extractCompanyFromTitle(title);
-      let symbol = await searchTickerByName(company);
-
-      // Fallback: try full title if company extraction was too strict
-      if (!symbol) symbol = await searchTickerByName(title);
-
-      if (symbol && iso) {
-        // tiny pause between calls to be nice to Yahoo
-        await pause(300);
-        const { change, periodText } = await getPctChangeAroundDate(symbol, iso);
-        const stockDiv = el.querySelector('.stock');
-        if (change == null) {
-          stockDiv.innerHTML = `Ticker <span class="ticker">${symbol}</span>: no price data`;
-          stockDiv.classList.remove('muted','up','down');
-        } else {
-          const cls = change >= 0 ? 'up' : 'down';
-          stockDiv.classList.remove('muted');
-          stockDiv.classList.add(cls);
-          stockDiv.innerHTML = `
-            Ticker <span class="ticker">${symbol}</span> — ${periodText}: ${change.toFixed(2)}%
-          `;
-        }
+    if (!items.length) {
+      // Some proxies might strip namespaces; try Atom <entry> as a fallback
+      const entries = Array.from(xml.querySelectorAll('entry'));
+      if (!entries.length) {
+        throw new Error('No <item> or <entry> elements found in feed.');
       } else {
-        const stockDiv = el.querySelector('.stock');
-        stockDiv.textContent = 'Ticker not found or date missing';
-        stockDiv.classList.add('muted');
+        // Atom fallback render (title/updated/link[@href])
+        newsEl.innerHTML = '';
+        entries.forEach(entry => {
+          const title = entry.querySelector('title')?.textContent?.trim() || 'No Title';
+          const link = entry.querySelector('link')?.getAttribute('href') || '#';
+          const date = entry.querySelector('updated')?.textContent || entry.querySelector('published')?.textContent || '';
+          const nice = date ? new Date(date).toLocaleString() : 'No Date';
+          const div = document.createElement('div');
+          div.className = 'news-item';
+          div.innerHTML = `<a href="${link}" target="_blank" rel="noopener">${title}</a><div class="date">${nice}</div>`;
+          newsEl.appendChild(div);
+        });
+        logStatus('Rendered Atom entries.');
+        return;
       }
-
-      // Optional: another small pause to smooth request bursts
-      await pause(150);
     }
+
+    // Render RSS items
+    newsEl.innerHTML = '';
+    items.forEach(item => {
+      const title = item.querySelector('title')?.textContent?.trim() || 'No Title';
+      const link = item.querySelector('link')?.textContent?.trim() || '#';
+      const pubDateStr = item.querySelector('pubDate')?.textContent?.trim() || '';
+      const nice = pubDateStr ? new Date(pubDateStr).toLocaleString() : 'No Date';
+
+      const div = document.createElement('div');
+      div.className = 'news-item';
+      div.innerHTML = `<a href="${link}" target="_blank" rel="noopener">${title}</a><div class="date">${nice}</div>`;
+      newsEl.appendChild(div);
+    });
+    logStatus('Rendered RSS items. Count: ' + items.length);
   } catch (e) {
     console.error(e);
-    container.textContent = 'Failed to load news.';
+    logStatus('ERROR: ' + e.message, true);
+    const newsEl = document.getElementById('news');
+    newsEl.innerHTML = '<div class="error">Failed to load news. See status above and console for details.</div>';
   }
 }
 
-fetchNews();
+loadFeed();
 </script>
 </body>
 </html>
