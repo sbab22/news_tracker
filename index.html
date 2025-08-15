@@ -2,18 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>Mining News (Robust Feed)</title>
+<title>Mining News + TSX Move (CSV Mapping)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   body { font-family: Arial, sans-serif; padding: 20px; background: #f9f9f9; }
   h1 { margin-top: 0; }
   #status { font-size: 0.9em; color: #555; margin-bottom: 10px; white-space: pre-wrap; }
-  .news-item { padding: 10px 0; border-bottom: 1px solid #ddd; }
-  .news-item a { font-weight: bold; color: #2a4d69; text-decoration: none; }
+  .news-item { padding: 12px 10px; border-bottom: 1px solid #ddd; }
+  .news-item a { font-weight: 700; color: #2a4d69; text-decoration: none; }
   .news-item a:hover { text-decoration: underline; }
   .date { font-size: 0.9em; color: #555; margin-top: 2px; }
-  .error { color: #b00020; }
+  .stock { font-size: 0.92em; margin-top: 6px; }
+  .stock .ticker { font-weight: 600; }
+  .stock.up { color: #0a7a0a; }
+  .stock.down { color: #b00020; }
   .muted { color: #777; }
+  .error { color: #b00020; }
 </style>
 </head>
 <body>
@@ -24,28 +28,26 @@
 <script>
 /* -------------------- Config -------------------- */
 const FEED_URL = 'https://www.juniorminingnetwork.com/index.php?option=com_obrss&task=feed&id=1:press-releases&format=feed&Itemid=688';
+const CSV_URL  = 'https://raw.githubusercontent.com/<username>/<repo>/main/companies.csv'; // <-- CHANGE THIS
 
-// Prefer multiple fallbacks for CORS
-function viaCorsproxy(url) {
-  return 'https://corsproxy.io/?' + encodeURIComponent(url);
-}
-function viaAllOrigins(url) {
-  return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
-}
+// Yahoo endpoints
+const YH_SEARCH = q =>
+  `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&enableFuzzyQuery=true&region=CA&lang=en-US`;
+const YH_CHART = (symbol, p1, p2) =>
+  `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${p1}&period2=${p2}&interval=1d`;
+
+// If you still hit CORS somewhere, flip this to true so we use proxies for all fetches.
+const USE_PROXIES = true;
+
+/* -------------------- Multi-proxy fetch -------------------- */
+function viaCorsproxy(url) { return 'https://corsproxy.io/?' + encodeURIComponent(url); }
+function viaAllOrigins(url) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url); }
 function viaJina(url) {
   const withHttps = url.startsWith('https://') ? url : 'https://' + url.replace(/^https?:\/\//, '');
-  // r.jina.ai returns text/plain, which is fine for XML text parsing
   return 'https://r.jina.ai/http/' + withHttps.replace(/^https?:\/\//, '');
 }
-
-// Try several URLs in order; return first successful Response
 async function fetchWithFallbacks(url, { asText = true } = {}) {
-  const attempts = [
-    url,                     // direct (rarely allowed for RSS)
-    viaCorsproxy(url),
-    viaAllOrigins(url),
-    viaJina(url),
-  ];
+  const attempts = USE_PROXIES ? [viaCorsproxy(url), viaAllOrigins(url), viaJina(url)] : [url, viaCorsproxy(url), viaAllOrigins(url), viaJina(url)];
   let lastErr;
   for (const u of attempts) {
     try {
@@ -61,82 +63,249 @@ async function fetchWithFallbacks(url, { asText = true } = {}) {
   }
   throw lastErr ?? new Error('All attempts failed');
 }
-
 function logStatus(msg, isError = false) {
   const el = document.getElementById('status');
   el.textContent += (el.textContent ? '\n' : '') + msg;
   if (isError) el.classList.add('error');
 }
 
-// Safe XML parse (shows parsererror details if any)
+/* -------------------- CSV loader & matcher -------------------- */
+function normalizeName(s) {
+  return s.toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^\w\s]/g, ' ') // remove punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function tokenize(s) { return new Set(normalizeName(s).split(' ').filter(Boolean)); }
+// Jaccard token overlap for simple fuzzy matching
+function jaccard(aSet, bSet) {
+  const a = new Set(aSet), b = new Set(bSet);
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const union = a.size + b.size - inter;
+  return union ? inter / union : 0;
+}
+
+async function loadCsvIndex() {
+  const text = await fetchWithFallbacks(CSV_URL);
+  const lines = text.split(/\r?\n/).filter(l => l.trim().length);
+  const header = lines.shift().split(',').map(h => h.trim().toLowerCase());
+  const colIdx = {
+    symbol: header.indexOf('symbol'),
+    exchange: header.indexOf('exchange'),
+    name: header.indexOf('name'),
+    aliases: header.indexOf('aliases'),
+  };
+  const rows = [];
+  for (const line of lines) {
+    // naive CSV split (ok for simple file; if you have commas inside names, quote them or use a tiny CSV parser)
+    const parts = line.split(',').map(x => x.trim());
+    const symbol = parts[colIdx.symbol];
+    const name = parts[colIdx.name];
+    const aliases = (colIdx.aliases >= 0 && parts[colIdx.aliases]) ? parts[colIdx.aliases].split('|').map(a => a.trim()).filter(Boolean) : [];
+    if (!symbol || !name) continue;
+    const keys = [name, ...aliases];
+    rows.push({ symbol, name, aliases, keys, tokens: keys.map(tokenize) });
+  }
+  return rows;
+}
+
+function extractTickerFromTitle(title) {
+  // 1) Formats like (TSX: ABC), (TSXV: ABC), (CSE: ABC), (NEO: ABC)
+  const ex1 = /(?:TSX|TSXV|CSE|NEO)\s*:\s*([A-Z][A-Z0-9\.-]{1,7})/gi;
+  let m;
+  const found = [];
+  while ((m = ex1.exec(title)) !== null) found.push(m[1]);
+  if (found.length) return found[0] + guessSuffixFromExchange(title);
+
+  // 2) Yahoo-suffixed tickers embedded in title: ABC.TO / ABC.V / ABC.CN
+  const ex2 = /\b([A-Z][A-Z0-9\.-]{1,7})\.(TO|V|CN)\b/g;
+  while ((m = ex2.exec(title)) !== null) return m[1] + '.' + m[2];
+
+  return null;
+}
+function guessSuffixFromExchange(title) {
+  const t = title.toUpperCase();
+  if (t.includes('TSXV')) return '.V';
+  if (t.includes('TSX'))  return '.TO';
+  if (t.includes('CSE'))  return '.CN';
+  if (t.includes('NEO'))  return '.TO'; // NEO often mirrors .TO on Yahoo
+  return '';
+}
+
+// Fuzzy search against CSV list
+function findTickerByCompany(rows, title) {
+  const companyGuess = guessCompanyFromTitle(title);
+  if (!companyGuess) return null;
+
+  // Exact first
+  const normGuess = normalizeName(companyGuess);
+  for (const r of rows) {
+    for (const k of r.keys) if (normalizeName(k) === normGuess) return r.symbol;
+  }
+
+  // Then fuzzy by Jaccard tokens
+  const guessTokens = tokenize(companyGuess);
+  let best = { s: null, score: 0 };
+  for (const r of rows) {
+    for (const toks of r.tokens) {
+      const score = jaccard(guessTokens, toks);
+      if (score > best.score) best = { s: r.symbol, score };
+    }
+  }
+  return best.score >= 0.4 ? best.s : null; // threshold; tune as needed
+}
+
+function guessCompanyFromTitle(title) {
+  // Take leading chunk until a common verb or separator appears
+  const breakers = [
+    ' announces',' closes',' provides',' reports',' intersects',' drills',' signs',' acquires',' starts',' begins',
+    ' receives',' appoints',' options',' enters',' discovers',' updates',' expands',' increases',' completes',' grants',
+    ' to ',' for ',' at '
+  ];
+  const lower = title.toLowerCase();
+  let cut = title.length;
+  for (const b of breakers) {
+    const i = lower.indexOf(b);
+    if (i > 0) cut = Math.min(cut, i);
+  }
+  let cand = title.slice(0, cut).replace(/^The\s+/i, '').trim();
+  cand = cand.replace(/[-–—|:•]+$/g, '').trim();
+  if (cand.split(/\s+/).length < 2) {
+    cand = title.split(/\s+/).slice(0, 3).join(' ');
+  }
+  return cand;
+}
+
+/* -------------------- Yahoo finance -------------------- */
+function firstLastValid(closes) {
+  if (!closes || !closes.length) return [null, null];
+  let a = null, b = null;
+  for (let i = 0; i < closes.length; i++) if (closes[i] != null) { a = closes[i]; break; }
+  for (let i = closes.length - 1; i >= 0; i--) if (closes[i] != null) { b = closes[i]; break; }
+  return [a, b];
+}
+function pct(a, b) { return (a == null || b == null) ? null : ((b - a) / a) * 100; }
+const pause = ms => new Promise(r => setTimeout(r, ms));
+
+async function getPctChangeAroundDate(symbol, isoDate) {
+  const ms = Date.parse(isoDate);
+  if (Number.isNaN(ms)) return { change: null, periodText: null };
+  const day = 24*60*60*1000, p1 = Math.floor((ms - 2*day)/1000), p2 = Math.floor((ms + 2*day)/1000);
+  const text = await fetchWithFallbacks(YH_CHART(symbol, p1, p2));
+  const j = JSON.parse(text);
+  const result = j?.chart?.result?.[0];
+  const closes = result?.indicators?.quote?.[0]?.close || [];
+  const [before, after] = firstLastValid(closes);
+  return { change: pct(before, after), periodText: '±2 trading days' };
+}
+
+/* -------------------- Feed + render -------------------- */
 function parseXmlOrThrow(text) {
-  const parser = new DOMParser();
-  const xml = parser.parseFromString(text, 'application/xml');
-  const err = xml.querySelector('parsererror');
-  if (err) {
-    // Some proxies wrap content; show first 200 chars for debugging
-    const snippet = text.slice(0, 200).replace(/\s+/g, ' ');
-    throw new Error('XML parse error. First 200 chars: ' + snippet);
+  const xml = new DOMParser().parseFromString(text, 'application/xml');
+  if (xml.querySelector('parsererror')) {
+    throw new Error('XML parse error');
   }
   return xml;
 }
-
-async function loadFeed() {
+async function render() {
   const newsEl = document.getElementById('news');
-  try {
-    logStatus('Fetching RSS…');
-    const xmlText = await fetchWithFallbacks(FEED_URL, { asText: true });
-    logStatus('Fetched. Parsing XML…');
-    const xml = parseXmlOrThrow(xmlText);
 
-    // RSS 2.0 uses <item>
+  try {
+    // Load CSV
+    logStatus('Loading company CSV…');
+    const rows = await loadCsvIndex();
+    logStatus('Company rows: ' + rows.length);
+
+    // Load RSS
+    logStatus('Fetching RSS…');
+    const xmlText = await fetchWithFallbacks(FEED_URL);
+    logStatus('Parsing XML…');
+    const xml = parseXmlOrThrow(xmlText);
     const items = Array.from(xml.querySelectorAll('item'));
-    if (!items.length) {
-      // Some proxies might strip namespaces; try Atom <entry> as a fallback
-      const entries = Array.from(xml.querySelectorAll('entry'));
-      if (!entries.length) {
-        throw new Error('No <item> or <entry> elements found in feed.');
+    newsEl.innerHTML = '';
+
+    const N = Math.min(15, items.length);
+    for (let i = 0; i < N; i++) {
+      const item = items[i];
+      const title = item.querySelector('title')?.textContent?.trim() || 'No Title';
+      const link  = item.querySelector('link')?.textContent?.trim() || '#';
+      // Robust date extraction
+      const pubDateStr = item.querySelector('pubDate')?.textContent?.trim()
+        || item.querySelector('dc\\:date')?.textContent?.trim()
+        || item.querySelector('updated')?.textContent?.trim()
+        || item.querySelector('published')?.textContent?.trim()
+        || '';
+      const iso = pubDateStr ? new Date(pubDateStr).toISOString() : null;
+      const nice = iso ? new Date(iso).toLocaleString() : 'No Date';
+
+      const el = document.createElement('div');
+      el.className = 'news-item';
+      el.innerHTML = `
+        <a href="${link}" target="_blank" rel="noopener">${title}</a>
+        <div class="date">${nice}</div>
+        <div class="stock muted">Finding ticker…</div>
+      `;
+      newsEl.appendChild(el);
+
+      // 1) Try to read ticker directly from title
+      let symbol = extractTickerFromTitle(title);
+
+      // 2) If not, exact/fuzzy match via CSV
+      if (!symbol) symbol = findTickerByCompany(rows, title);
+
+      // 3) As a last resort, ask Yahoo search (optional; comment out if you want purely CSV)
+      if (!symbol) {
+        try {
+          const text = await fetchWithFallbacks(YH_SEARCH(guessCompanyFromTitle(title)));
+          const sJson = JSON.parse(text);
+          const pick = (sJson.quotes || []).find(q => /\.TO$|\.V$|\.CN$/i.test(q.symbol));
+          if (pick) symbol = pick.symbol;
+        } catch (e) {
+          console.warn('Yahoo search fallback failed', e);
+        }
+      }
+
+      const stockDiv = el.querySelector('.stock');
+
+      if (!symbol) {
+        stockDiv.textContent = 'Ticker not found (CSV + title + search failed)';
+        continue;
+      }
+
+      // Got a symbol; compute move
+      if (iso) {
+        try {
+          await pause(250);
+          const { change, periodText } = await getPctChangeAroundDate(symbol, iso);
+          if (change == null) {
+            stockDiv.textContent = `Ticker ${symbol}: no price data`;
+            stockDiv.classList.remove('muted');
+          } else {
+            const cls = change >= 0 ? 'up' : 'down';
+            stockDiv.classList.remove('muted');
+            stockDiv.classList.add(cls);
+            stockDiv.innerHTML = `Ticker <span class="ticker">${symbol}</span> — ${periodText}: ${change.toFixed(2)}%`;
+          }
+        } catch (e) {
+          console.error(e);
+          stockDiv.textContent = `Ticker ${symbol}: price lookup failed`;
+          stockDiv.classList.remove('muted');
+        }
       } else {
-        // Atom fallback render (title/updated/link[@href])
-        newsEl.innerHTML = '';
-        entries.forEach(entry => {
-          const title = entry.querySelector('title')?.textContent?.trim() || 'No Title';
-          const link = entry.querySelector('link')?.getAttribute('href') || '#';
-          const date = entry.querySelector('updated')?.textContent || entry.querySelector('published')?.textContent || '';
-          const nice = date ? new Date(date).toLocaleString() : 'No Date';
-          const div = document.createElement('div');
-          div.className = 'news-item';
-          div.innerHTML = `<a href="${link}" target="_blank" rel="noopener">${title}</a><div class="date">${nice}</div>`;
-          newsEl.appendChild(div);
-        });
-        logStatus('Rendered Atom entries.');
-        return;
+        stockDiv.textContent = `Ticker ${symbol}: date missing`;
+        stockDiv.classList.remove('muted');
       }
     }
-
-    // Render RSS items
-    newsEl.innerHTML = '';
-    items.forEach(item => {
-      const title = item.querySelector('title')?.textContent?.trim() || 'No Title';
-      const link = item.querySelector('link')?.textContent?.trim() || '#';
-      const pubDateStr = item.querySelector('pubDate')?.textContent?.trim() || '';
-      const nice = pubDateStr ? new Date(pubDateStr).toLocaleString() : 'No Date';
-
-      const div = document.createElement('div');
-      div.className = 'news-item';
-      div.innerHTML = `<a href="${link}" target="_blank" rel="noopener">${title}</a><div class="date">${nice}</div>`;
-      newsEl.appendChild(div);
-    });
-    logStatus('Rendered RSS items. Count: ' + items.length);
+    logStatus('Done.');
   } catch (e) {
     console.error(e);
     logStatus('ERROR: ' + e.message, true);
-    const newsEl = document.getElementById('news');
-    newsEl.innerHTML = '<div class="error">Failed to load news. See status above and console for details.</div>';
+    newsEl.innerHTML = '<div class="error">Failed to load. See status above.</div>';
   }
 }
-
-loadFeed();
+render();
 </script>
 </body>
 </html>
