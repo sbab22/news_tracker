@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>Mining News + TSX Move (CSV Mapping)</title>
+<title>Mining News + TSX Move</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   body { font-family: Arial, sans-serif; padding: 20px; background: #f9f9f9; }
@@ -27,26 +27,23 @@
 
 <script>
 /* ===================== Config ===================== */
-const CSV_URL  = 'companies.csv'; // <-- your file name, same folder
+const CSV_URL  = 'companies.csv'; // your file (same folder)
 const FEED_URL = 'https://www.juniorminingnetwork.com/index.php?option=com_obrss&task=feed&id=1:press-releases&format=feed&Itemid=688';
 
 // Yahoo endpoints
-const YH_SEARCH = q =>
-  `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&enableFuzzyQuery=true&region=CA&lang=en-US`;
 const YH_CHART = (symbol, p1, p2) =>
   `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${p1}&period2=${p2}&interval=1d`;
 
-// If Yahoo/JMN block CORS from your Pages domain, keep this true
+// Keep proxies ON for cross-origin calls (RSS + Yahoo)
 const USE_PROXIES = true;
 
-/* ================= Multi-proxy fetch ================= */
+/* ================ Multi-proxy fetch (for cross-origin) ================ */
 function viaCorsproxy(url) { return 'https://corsproxy.io/?' + encodeURIComponent(url); }
 function viaAllOrigins(url) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url); }
 function viaJina(url) {
-  const withHttps = url.startsWith('https://') ? url : 'https://' + url.replace(/^https?:\/\//, '');
-  return 'https://r.jina.ai/http/' + withHttps.replace(/^https?:\/\//, '');
+  const withHttps = url.startsWith('https://') ? url : 'https://' + url.replace(/^https?:\/\//,'');
+  return 'https://r.jina.ai/http/' + withHttps.replace(/^https?:\/\//,'');
 }
-// Use proxies for cross-origin (RSS + Yahoo). CSV uses same-origin fetch.
 async function fetchWithFallbacks(url, { asText = true } = {}) {
   const attempts = USE_PROXIES ? [viaCorsproxy(url), viaAllOrigins(url), viaJina(url)] : [url, viaCorsproxy(url), viaAllOrigins(url), viaJina(url)];
   let lastErr;
@@ -57,9 +54,7 @@ async function fetchWithFallbacks(url, { asText = true } = {}) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return asText ? await res.text() : await res.arrayBuffer();
     } catch (e) {
-      lastErr = e;
-      logStatus('Failed: ' + u + ' — ' + e.message);
-      console.error('Fetch failed', u, e);
+      lastErr = e; logStatus('Failed: ' + u + ' — ' + e.message); console.warn('Fetch failed', u, e);
     }
   }
   throw lastErr ?? new Error('All attempts failed');
@@ -70,10 +65,9 @@ function logStatus(msg, isError = false) {
   if (isError) el.classList.add('error');
 }
 
-/* ================= CSV loader & matcher ================= */
-// NOTE: If any field contains commas, wrap it in quotes in companies.csv
+/* ================= CSV loader (matches your header) ================= */
 async function loadCsvIndex() {
-  const res = await fetch(CSV_URL); // same-origin; no proxy
+  const res = await fetch(CSV_URL); // same-origin
   if (!res.ok) throw new Error('CSV HTTP ' + res.status);
   let text = await res.text();
   text = text.replace(/^\uFEFF/, ''); // strip BOM
@@ -81,6 +75,7 @@ async function loadCsvIndex() {
   const lines = text.split(/\r?\n/).filter(l => l.trim().length);
   if (!lines.length) throw new Error('CSV is empty');
 
+  // Expect: symbol,exchange,name,aliases
   const header = lines.shift().split(',').map(h => h.trim().toLowerCase());
   const col = {
     symbol: header.indexOf('symbol'),
@@ -88,15 +83,13 @@ async function loadCsvIndex() {
     name: header.indexOf('name'),
     aliases: header.indexOf('aliases'),
   };
-  if (col.symbol < 0 || col.name < 0) {
-    throw new Error('CSV missing "symbol" or "name" header');
-  }
+  if (col.symbol < 0 || col.name < 0) throw new Error('CSV missing "symbol" or "name" header');
 
   const rows = [];
   for (const line of lines) {
-    const parts = line.split(',').map(x => x.trim()); // simple split
+    const parts = line.split(',').map(x => x.trim()); // OK for your sample rows
     const symbol = parts[col.symbol];
-    const name = parts[col.name];
+    const name   = parts[col.name];
     if (!symbol || !name) continue;
     const aliases = (col.aliases >= 0 && parts[col.aliases])
       ? parts[col.aliases].split('|').map(a => a.trim()).filter(Boolean)
@@ -106,6 +99,7 @@ async function loadCsvIndex() {
   return rows;
 }
 
+/* ================= Matching helpers ================= */
 function normalizeName(s) {
   return s.toLowerCase()
     .replace(/&/g, ' and ')
@@ -116,13 +110,10 @@ function normalizeName(s) {
 function tokenize(s) { return new Set(normalizeName(s).split(' ').filter(Boolean)); }
 function jaccard(aSet, bSet) {
   const a = new Set(aSet), b = new Set(bSet);
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
+  let inter = 0; for (const x of a) if (b.has(x)) inter++;
   const union = a.size + b.size - inter;
   return union ? inter / union : 0;
 }
-
-// Pull company name from title (heuristic: text before a verb/keyword)
 function guessCompanyFromTitle(title) {
   const breakers = [
     ' announces',' closes',' provides',' reports',' intersects',' drills',' signs',' acquires',' starts',' begins',
@@ -131,16 +122,12 @@ function guessCompanyFromTitle(title) {
   ];
   const lower = title.toLowerCase();
   let cut = title.length;
-  for (const b of breakers) {
-    const i = lower.indexOf(b);
-    if (i > 0) cut = Math.min(cut, i);
-  }
+  for (const b of breakers) { const i = lower.indexOf(b); if (i > 0) cut = Math.min(cut, i); }
   let cand = title.slice(0, cut).replace(/^The\s+/i, '').replace(/[-–—|:•]+$/g, '').trim();
   if (cand.split(/\s+/).length < 2) cand = title.split(/\s+/).slice(0, 3).join(' ');
   return cand;
 }
-
-// 1) Ticker directly in title: (TSXV: ABC), ABC.V, ABC.TO, ABC.CN
+// 1) Try to read ticker directly from title: (TSXV: ABC), ABC.V, ABC.TO, ABC.CN
 function extractTickerFromTitle(title) {
   const ex1 = /(?:TSX|TSXV|CSE|NEO)\s*:\s*([A-Z][A-Z0-9\.-]{1,7})/gi;
   let m; const found = [];
@@ -160,8 +147,7 @@ function guessSuffixFromExchange(title) {
   if (t.includes('NEO'))  return '.TO';
   return '';
 }
-
-// 2) Exact/fuzzy against CSV
+// 2) Exact/fuzzy via CSV (your file)
 function findTickerByCompany(rows, title) {
   const guess = guessCompanyFromTitle(title);
   const normGuess = normalizeName(guess);
@@ -180,7 +166,7 @@ function findTickerByCompany(rows, title) {
       if (score > best.score) best = { sym: r.symbol, score };
     }
   }
-  return best.score >= 0.4 ? best.sym : null; // tune threshold if needed
+  return best.score >= 0.4 ? best.sym : null;
 }
 
 /* ================= Yahoo Finance ================= */
@@ -197,11 +183,9 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 async function getPctChangeAroundDate(symbol, isoDate) {
   const ms = Date.parse(isoDate);
   if (Number.isNaN(ms)) return { change: null, periodText: null };
-
   const day = 24*60*60*1000;
   const p1 = Math.floor((ms - 2*day)/1000);
   const p2 = Math.floor((ms + 2*day)/1000);
-
   const text = await fetchWithFallbacks(YH_CHART(symbol, p1, p2));
   const j = JSON.parse(text);
   const result = j?.chart?.result?.[0];
@@ -241,7 +225,7 @@ async function render() {
       const item = items[i];
       const title = item.querySelector('title')?.textContent?.trim() || 'No Title';
       const link  = item.querySelector('link')?.textContent?.trim() || '#';
-      // Robust date extraction (RSS + some Atom fields just in case)
+      // Robust date extraction; convert to ISO once
       const pubDateStr = item.querySelector('pubDate')?.textContent?.trim()
         || item.querySelector('dc\\:date')?.textContent?.trim()
         || item.querySelector('updated')?.textContent?.trim()
@@ -259,51 +243,38 @@ async function render() {
       `;
       newsEl.appendChild(el);
 
-      // 1) Try reading ticker directly from title
+      // 1) Ticker in title
       let symbol = extractTickerFromTitle(title);
-
       // 2) CSV exact/fuzzy
       if (!symbol) symbol = findTickerByCompany(rows, title);
-
-      // 3) Optional Yahoo search fallback (kept in for edge cases)
-      if (!symbol) {
-        try {
-          const sText = await fetchWithFallbacks(YH_SEARCH(guessCompanyFromTitle(title)));
-          const sJson = JSON.parse(sText);
-          const pick = (sJson.quotes || []).find(q => /\.TO$|\.V$|\.CN$/i.test(q.symbol));
-          if (pick) symbol = pick.symbol;
-        } catch (e) {
-          console.warn('Yahoo search fallback failed', e);
-        }
-      }
 
       const stockDiv = el.querySelector('.stock');
 
       if (!symbol) {
-        stockDiv.textContent = 'Ticker not found (title + CSV + search failed)';
+        stockDiv.textContent = 'Ticker not found (title + CSV failed)';
+        continue;
+      }
+      if (!iso) {
+        stockDiv.textContent = `Ticker ${symbol}: date missing`;
+        stockDiv.classList.remove('muted');
         continue;
       }
 
-      if (iso) {
-        try {
-          await pause(250); // be gentle with Yahoo
-          const { change, periodText } = await getPctChangeAroundDate(symbol, iso);
-          if (change == null) {
-            stockDiv.textContent = `Ticker ${symbol}: no price data`;
-            stockDiv.classList.remove('muted');
-          } else {
-            const cls = change >= 0 ? 'up' : 'down';
-            stockDiv.classList.remove('muted');
-            stockDiv.classList.add(cls);
-            stockDiv.innerHTML = `Ticker <span class="ticker">${symbol}</span> — ${periodText}: ${change.toFixed(2)}%`;
-          }
-        } catch (e) {
-          console.error(e);
-          stockDiv.textContent = `Ticker ${symbol}: price lookup failed`;
+      try {
+        await pause(250); // polite spacing
+        const { change, periodText } = await getPctChangeAroundDate(symbol, iso);
+        if (change == null) {
+          stockDiv.textContent = `Ticker ${symbol}: no price data`;
           stockDiv.classList.remove('muted');
+        } else {
+          const cls = change >= 0 ? 'up' : 'down';
+          stockDiv.classList.remove('muted');
+          stockDiv.classList.add(cls);
+          stockDiv.innerHTML = `Ticker <span class="ticker">${symbol}</span> — ${periodText}: ${change.toFixed(2)}%`;
         }
-      } else {
-        stockDiv.textContent = `Ticker ${symbol}: date missing`;
+      } catch (e) {
+        console.error(e);
+        stockDiv.textContent = `Ticker ${symbol}: price lookup failed`;
         stockDiv.classList.remove('muted');
       }
     }
@@ -314,16 +285,7 @@ async function render() {
     newsEl.innerHTML = '<div class="error">Failed to load. See status above.</div>';
   }
 }
-
 render();
-
-/* ===== Optional: quick debug from console =====
-window.debugLookup = async function(q) {
-  const rows = await loadCsvIndex();
-  console.log('Rows loaded:', rows.length);
-  console.log('Lookup', q, '→', findTickerByCompany(rows, q));
-};
-*/
 </script>
 </body>
 </html>
