@@ -67,33 +67,60 @@ function logStatus(msg, isError = false) {
 
 /* ================= CSV loader (matches your header) ================= */
 async function loadCsvIndex() {
-  const res = await fetch(CSV_URL); // same-origin
+  const res = await fetch(CSV_URL, { cache: 'no-store' }); // same-origin
   if (!res.ok) throw new Error('CSV HTTP ' + res.status);
+
   let text = await res.text();
   text = text.replace(/^\uFEFF/, ''); // strip BOM
 
   const lines = text.split(/\r?\n/).filter(l => l.trim().length);
   if (!lines.length) throw new Error('CSV is empty');
 
-  // Expect: symbol,exchange,name,aliases
-  const header = lines.shift().split(',').map(h => h.trim().toLowerCase());
+  // Detect delimiter from header: prefer ';' if present and ',' not present
+  const headerLine = lines.shift();
+  const delim = (headerLine.includes(';') && !headerLine.includes(',')) ? ';' : ',';
+
+  // Safe CSV splitter for one line (handles quotes, escaped quotes)
+  const splitCsv = (line) => {
+    const out = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i], nx = line[i+1];
+      if (ch === '"') {
+        if (inQ && nx === '"') { cur += '"'; i++; } // escaped quote ""
+        else { inQ = !inQ; }
+      } else if (ch === delim && !inQ) {
+        out.push(cur); cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    out.push(cur);
+    return out.map(s => s.trim().replace(/^"|"$/g, ''));
+  };
+
+  const header = splitCsv(headerLine).map(h => h.toLowerCase());
   const col = {
     symbol: header.indexOf('symbol'),
     exchange: header.indexOf('exchange'),
     name: header.indexOf('name'),
     aliases: header.indexOf('aliases'),
   };
-  if (col.symbol < 0 || col.name < 0) throw new Error('CSV missing "symbol" or "name" header');
+  if (col.symbol < 0 || col.name < 0) {
+    throw new Error('CSV missing "symbol" or "name" header (got: ' + header.join('|') + ')');
+  }
 
   const rows = [];
   for (const line of lines) {
-    const parts = line.split(',').map(x => x.trim()); // OK for your sample rows
+    const parts = splitCsv(line);
     const symbol = parts[col.symbol];
     const name   = parts[col.name];
     if (!symbol || !name) continue;
-    const aliases = (col.aliases >= 0 && parts[col.aliases])
-      ? parts[col.aliases].split('|').map(a => a.trim()).filter(Boolean)
-      : [];
+
+    const aliasesRaw = (col.aliases >= 0 && parts[col.aliases]) ? parts[col.aliases] : '';
+    // Aliases are pipe-separated in your file
+    const aliases = aliasesRaw.split('|').map(a => a.trim()).filter(Boolean);
+
     rows.push({ symbol, name, aliases });
   }
   return rows;
@@ -289,3 +316,4 @@ render();
 </script>
 </body>
 </html>
+
