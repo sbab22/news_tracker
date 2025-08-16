@@ -9,11 +9,28 @@
   h1 { margin-top: 0; }
   #status { font-size: 0.9em; color: #555; margin-bottom: 10px; white-space: pre-wrap; }
   .news-item { padding: 12px 10px; border-bottom: 1px solid #ddd; }
+  .row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
   .news-item a { font-weight: 700; color: #2a4d69; text-decoration: none; }
   .news-item a:hover { text-decoration: underline; }
-  .date { font-size: 0.9em; color: #555; margin-top: 2px; }
+  .date { font-size: 0.9em; color: #555; margin-top: 4px; }
   .muted { color: #777; }
   .error { color: #b00020; }
+
+  /* Inline editor to the right of title */
+  .inline-editor { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .inline-editor input {
+    font: inherit;
+    padding: 4px 6px;
+    border: 1px solid #cfcfcf;
+    border-radius: 6px;
+    background: #fff;
+    min-width: 70px;
+  }
+  .inline-editor input.ticker { min-width: 80px; }
+  .inline-editor input.price { width: 100px; }
+  .change { font-size: 0.92em; }
+  .change.up { color: #0a7a0a; }
+  .change.down { color: #b00020; }
 </style>
 </head>
 <body>
@@ -94,7 +111,22 @@ function getItemDate(item) {
   return { iso, nice };
 }
 
-/* ================= Main render ================= */
+/* ============== Simple storage (so your inputs persist) ============== */
+const storeKey = (id) => 'news-notes::' + id;
+function saveNotes(id, data) {
+  try { localStorage.setItem(storeKey(id), JSON.stringify(data)); } catch {}
+}
+function loadNotes(id) {
+  try { return JSON.parse(localStorage.getItem(storeKey(id)) || 'null'); } catch { return null; }
+}
+
+/* ================= Render ================= */
+function percentChange(before, after) {
+  const a = parseFloat(before), b = parseFloat(after);
+  if (!isFinite(a) || !isFinite(b) || a === 0) return null;
+  return ((b - a) / a) * 100;
+}
+
 async function render() {
   const newsEl = document.getElementById('news');
   try {
@@ -121,13 +153,72 @@ async function render() {
       const link  = getItemLink(it);
       const { nice } = getItemDate(it);
 
+      const id = link || title; // key for persistence
+
+      // Build UI
       const el = document.createElement('div');
       el.className = 'news-item';
-      el.innerHTML = `
-        <a href="${link}" target="_blank" rel="noopener">${title}</a>
-        <div class="date">${nice}</div>
+
+      const row = document.createElement('div');
+      row.className = 'row';
+
+      const a = document.createElement('a');
+      a.href = link; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = title;
+
+      const editor = document.createElement('div');
+      editor.className = 'inline-editor';
+      editor.innerHTML = `
+        <input class="ticker" placeholder="Ticker">
+        <input class="price before" type="number" step="0.0001" placeholder="Price T−2d">
+        <input class="price after"  type="number" step="0.0001" placeholder="Price T+2d">
+        <span class="change muted">—</span>
       `;
+
+      row.appendChild(a);
+      row.appendChild(editor);
+      el.appendChild(row);
+
+      const dateDiv = document.createElement('div');
+      dateDiv.className = 'date';
+      dateDiv.textContent = nice;
+      el.appendChild(dateDiv);
+
       newsEl.appendChild(el);
+
+      // Restore saved values (if any)
+      const saved = loadNotes(id);
+      const $ticker = editor.querySelector('.ticker');
+      const $before = editor.querySelector('.before');
+      const $after  = editor.querySelector('.after');
+      const $chg    = editor.querySelector('.change');
+
+      if (saved) {
+        if (saved.ticker) $ticker.value = saved.ticker;
+        if (saved.before != null) $before.value = saved.before;
+        if (saved.after  != null) $after.value  = saved.after;
+      }
+
+      const recompute = () => {
+        const c = percentChange($before.value, $after.value);
+        $chg.classList.remove('up','down','muted');
+        if (c == null) {
+          $chg.textContent = '—';
+          $chg.classList.add('muted');
+        } else {
+          $chg.textContent = (c >= 0 ? '+' : '') + c.toFixed(2) + '%';
+          $chg.classList.add(c >= 0 ? 'up' : 'down');
+        }
+        saveNotes(id, { ticker: $ticker.value.trim(), before: $before.value, after: $after.value });
+      };
+
+      [$ticker, $before, $after].forEach(inp => {
+        inp.addEventListener('input', recompute);
+        inp.addEventListener('blur', recompute);
+      });
+
+      // Initial compute
+      recompute();
     }
 
     logStatus('Done. Rendered ' + N + ' items.');
