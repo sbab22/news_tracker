@@ -27,7 +27,7 @@
 
 <script>
 /* ===================== Config ===================== */
-const CSV_URL  = 'companies.csv'; // your file (same folder)
+const CSV_URL  = 'companies.csv?v=2'; // cache-bust; keep file in same folder
 const FEED_URL = 'https://www.juniorminingnetwork.com/index.php?option=com_obrss&task=feed&id=1:press-releases&format=feed&Itemid=688';
 
 // Yahoo endpoints
@@ -65,31 +65,47 @@ function logStatus(msg, isError = false) {
   if (isError) el.classList.add('error');
 }
 
-/* ================= CSV loader (matches your header) ================= */
+/* ================= Robust CSV loader (matches your header) ================= */
 async function loadCsvIndex() {
-  const res = await fetch(CSV_URL, { cache: 'no-store' }); // same-origin
-  if (!res.ok) throw new Error('CSV HTTP ' + res.status);
+  const resp = await fetch(CSV_URL, { cache: 'no-store' });
+  if (!resp.ok) throw new Error('CSV HTTP ' + resp.status);
 
-  let text = await res.text();
-  text = text.replace(/^\uFEFF/, ''); // strip BOM
+  let text = await resp.text();
 
-  const lines = text.split(/\r?\n/).filter(l => l.trim().length);
+  // Strip BOM/zero-widths and normalize newlines
+  text = text
+    .replace(/^\uFEFF/, '')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
+    .replace(/\r\n?/g, '\n')
+    .trim();
+
+  const lines = text.split('\n').filter(l => l.trim().length);
   if (!lines.length) throw new Error('CSV is empty');
 
-  // Detect delimiter from header: prefer ';' if present and ',' not present
   const headerLine = lines.shift();
-  const delim = (headerLine.includes(';') && !headerLine.includes(',')) ? ';' : ',';
+  const sampleLine = lines[0] || '';
 
-  // Safe CSV splitter for one line (handles quotes, escaped quotes)
+  // Detect common delimiters; your file uses comma
+  const detectDelim = (h, s) => {
+    const cand = [',', ';', '\t', '|'];
+    let best = ',', bestScore = -1;
+    for (const d of cand) {
+      const score = (h.split(d).length-1) + (s.split(d).length-1);
+      if (score > bestScore) { best = d; bestScore = score; }
+    }
+    return best;
+  };
+  const DELIM = detectDelim(headerLine, sampleLine);
+
+  // CSV splitter that handles quotes/escaped quotes
   const splitCsv = (line) => {
     const out = [];
     let cur = '', inQ = false;
     for (let i = 0; i < line.length; i++) {
       const ch = line[i], nx = line[i+1];
       if (ch === '"') {
-        if (inQ && nx === '"') { cur += '"'; i++; } // escaped quote ""
-        else { inQ = !inQ; }
-      } else if (ch === delim && !inQ) {
+        if (inQ && nx === '"') { cur += '"'; i++; } else { inQ = !inQ; }
+      } else if (ch === DELIM && !inQ) {
         out.push(cur); cur = '';
       } else {
         cur += ch;
@@ -99,30 +115,34 @@ async function loadCsvIndex() {
     return out.map(s => s.trim().replace(/^"|"$/g, ''));
   };
 
-  const header = splitCsv(headerLine).map(h => h.toLowerCase());
+  const header = splitCsv(headerLine).map(h => h.toLowerCase().trim());
   const col = {
-    symbol: header.indexOf('symbol'),
+    symbol:   header.indexOf('symbol'),
     exchange: header.indexOf('exchange'),
-    name: header.indexOf('name'),
-    aliases: header.indexOf('aliases'),
+    name:     header.indexOf('name'),
+    aliases:  header.indexOf('aliases'),
   };
   if (col.symbol < 0 || col.name < 0) {
-    throw new Error('CSV missing "symbol" or "name" header (got: ' + header.join('|') + ')');
+    throw new Error('CSV missing "symbol" or "name" header (got: ' + header.join(',') + ')');
   }
 
   const rows = [];
   for (const line of lines) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
     const parts = splitCsv(line);
-    const symbol = parts[col.symbol];
-    const name   = parts[col.name];
+
+    const symbol = (parts[col.symbol]   || '').trim();
+    const name   = (parts[col.name]     || '').trim();
     if (!symbol || !name) continue;
 
-    const aliasesRaw = (col.aliases >= 0 && parts[col.aliases]) ? parts[col.aliases] : '';
-    // Aliases are pipe-separated in your file
+    const aliasesRaw = (col.aliases >= 0 ? (parts[col.aliases] || '') : '');
     const aliases = aliasesRaw.split('|').map(a => a.trim()).filter(Boolean);
 
     rows.push({ symbol, name, aliases });
   }
+
+  if (!rows.length) throw new Error('No data rows with symbol+name found.');
+  logStatus(`CSV parsed: ${rows.length} rows (delimiter "${DELIM}")`);
   return rows;
 }
 
@@ -154,7 +174,6 @@ function guessCompanyFromTitle(title) {
   if (cand.split(/\s+/).length < 2) cand = title.split(/\s+/).slice(0, 3).join(' ');
   return cand;
 }
-// 1) Try to read ticker directly from title: (TSXV: ABC), ABC.V, ABC.TO, ABC.CN
 function extractTickerFromTitle(title) {
   const ex1 = /(?:TSX|TSXV|CSE|NEO)\s*:\s*([A-Z][A-Z0-9\.-]{1,7})/gi;
   let m; const found = [];
@@ -174,7 +193,6 @@ function guessSuffixFromExchange(title) {
   if (t.includes('NEO'))  return '.TO';
   return '';
 }
-// 2) Exact/fuzzy via CSV (your file)
 function findTickerByCompany(rows, title) {
   const guess = guessCompanyFromTitle(title);
   const normGuess = normalizeName(guess);
@@ -252,7 +270,6 @@ async function render() {
       const item = items[i];
       const title = item.querySelector('title')?.textContent?.trim() || 'No Title';
       const link  = item.querySelector('link')?.textContent?.trim() || '#';
-      // Robust date extraction; convert to ISO once
       const pubDateStr = item.querySelector('pubDate')?.textContent?.trim()
         || item.querySelector('dc\\:date')?.textContent?.trim()
         || item.querySelector('updated')?.textContent?.trim()
@@ -270,9 +287,9 @@ async function render() {
       `;
       newsEl.appendChild(el);
 
-      // 1) Ticker in title
+      // 1) Try to read ticker directly from title
       let symbol = extractTickerFromTitle(title);
-      // 2) CSV exact/fuzzy
+      // 2) Fallback: exact/fuzzy via CSV
       if (!symbol) symbol = findTickerByCompany(rows, title);
 
       const stockDiv = el.querySelector('.stock');
@@ -288,7 +305,7 @@ async function render() {
       }
 
       try {
-        await pause(250); // polite spacing
+        await pause(250);
         const { change, periodText } = await getPctChangeAroundDate(symbol, iso);
         if (change == null) {
           stockDiv.textContent = `Ticker ${symbol}: no price data`;
@@ -316,4 +333,3 @@ render();
 </script>
 </body>
 </html>
-
